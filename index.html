@@ -3,7 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FORLAB - Plate Cropper</title>
+<title>FORLAB - 번호판 자동 크롭 도구 | AI 기반 이미지 처리</title>
+<meta name="description" content="FORLAB Plate Cropper는 AI 기반 Hough Transform 알고리즘으로 차량 번호판을 자동 감지하고 크롭하는 무료 온라인 도구입니다. 다중 이미지 일괄 처리를 지원합니다.">
+<meta name="keywords" content="번호판 크롭, plate cropper, 이미지 처리, AI 감지, 번호판 자동 인식, FORLAB">
+<meta name="author" content="FORLAB">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://brianqwe89.github.io/">
+<meta property="og:title" content="FORLAB - 번호판 자동 크롭 도구">
+<meta property="og:description" content="AI 기반으로 차량 번호판을 자동 감지하고 크롭하는 무료 온라인 도구">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://brianqwe89.github.io/">
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
   *{margin:0;padding:0;box-sizing:border-box}
@@ -13,7 +22,7 @@
     --border:#2a2440;--text:#e8ecf0;--muted:#8b7faa;
     --danger:#ff5c5c;--warn:#ffc84e;
   }
-  html,body{height:100%;overflow:hidden}
+  html,body{height:100%}
   body{
     background:var(--bg);color:var(--text);
     font-family:'JetBrains Mono','SF Mono',monospace;
@@ -206,7 +215,38 @@
 
   .hidden{display:none!important}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-  /* Google Ads containers */
+
+  /* Navigation */
+  .site-nav{
+    display:flex;align-items:center;gap:16px;padding:0 20px;
+    border-bottom:1px solid var(--border);flex-shrink:0;
+  }
+  .site-nav a{
+    color:var(--muted);font-size:11px;text-decoration:none;padding:10px 0;
+    border-bottom:2px solid transparent;transition:all .15s;letter-spacing:.04em;
+  }
+  .site-nav a:hover,.site-nav a.active{color:var(--text);border-bottom-color:#a78bfa}
+
+  /* Page sections */
+  .page-section{display:none;flex:1;overflow-y:auto;padding:32px 20px;max-width:800px;margin:0 auto}
+  .page-section.visible{display:block}
+  .page-section h2{font-size:20px;margin-bottom:16px;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+  .page-section h3{font-size:15px;color:var(--accent);margin:20px 0 8px}
+  .page-section p,.page-section li{font-size:13px;line-height:1.8;color:var(--text);margin-bottom:8px}
+  .page-section ul{padding-left:20px;margin-bottom:16px}
+  .page-section .feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:16px 0}
+  .page-section .feature-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px}
+  .feature-card h4{font-size:13px;color:#c4b5fd;margin-bottom:6px}
+  .feature-card p{font-size:12px;color:var(--muted);margin:0}
+  .step-list{counter-reset:step}
+  .step-list li{counter-increment:step;list-style:none;position:relative;padding-left:32px;margin-bottom:16px}
+  .step-list li::before{content:counter(step);position:absolute;left:0;top:0;width:22px;height:22px;border-radius:50%;background:var(--grad);color:var(--bg);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
+
+  /* App wrapper - hides app content when not on tool page */
+  .app-content{display:none;flex-direction:column;flex:1;overflow:hidden}
+  .app-content.visible{display:flex}
+
+  /* Google Ads container - only in content areas */
   .ad-container{
     width:100%;text-align:center;
     background:var(--surface);border-bottom:1px solid var(--border);
@@ -214,14 +254,15 @@
     display:flex;align-items:center;justify-content:center;
     overflow:hidden;
   }
-  .ad-container-bottom{
-    width:100%;text-align:center;
-    background:var(--surface);border-top:1px solid var(--border);
-    padding:4px 0;min-height:90px;
-    display:flex;align-items:center;justify-content:center;
-    overflow:hidden;position:fixed;bottom:0;left:0;z-index:100;
+
+  /* Footer */
+  .site-footer{
+    flex-shrink:0;padding:12px 20px;border-top:1px solid var(--border);
+    display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;
+    font-size:10px;color:var(--muted);
   }
-  .main{padding-bottom:100px}
+  .site-footer a{color:var(--muted);text-decoration:none}
+  .site-footer a:hover{color:var(--text)}
 </style>
 <!-- Google AdSense -->
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-8434032741883820" crossorigin="anonymous"></script>
@@ -230,6 +271,143 @@
 
 <!-- Toast -->
 <div class="toast" id="toast"></div>
+
+<!-- Site Navigation -->
+<nav class="site-nav">
+  <a href="#" class="active" data-page="home">홈</a>
+  <a href="#tool" data-page="tool">도구</a>
+  <a href="#guide" data-page="guide">사용법</a>
+  <a href="#about" data-page="about">소개</a>
+  <a href="#privacy" data-page="privacy">개인정보처리방침</a>
+</nav>
+
+<!-- ===== HOME PAGE ===== -->
+<section class="page-section visible" id="page-home">
+  <h2>FORLAB Plate Cropper</h2>
+  <p>FORLAB Plate Cropper는 AI 기반 이미지 처리 기술을 활용하여 차량 번호판 영역을 자동으로 감지하고 크롭하는 무료 온라인 도구입니다. Hough Transform 알고리즘과 Sobel 엣지 검출을 사용하여 이미지에서 원형 객체를 정확하게 식별합니다.</p>
+
+  <h3>주요 기능</h3>
+  <div class="feature-grid">
+    <div class="feature-card">
+      <h4>AI 자동 감지</h4>
+      <p>Sobel 엣지 검출과 Hough Transform 알고리즘을 결합하여 이미지에서 번호판 영역을 자동으로 찾아냅니다.</p>
+    </div>
+    <div class="feature-card">
+      <h4>일괄 처리</h4>
+      <p>여러 장의 이미지를 한 번에 업로드하고 자동으로 처리할 수 있습니다. 대량의 이미지도 효율적으로 작업합니다.</p>
+    </div>
+    <div class="feature-card">
+      <h4>수동 조정</h4>
+      <p>자동 감지 결과를 드래그하여 위치와 크기를 수동으로 미세 조정할 수 있습니다.</p>
+    </div>
+    <div class="feature-card">
+      <h4>다운로드 &amp; 공유</h4>
+      <p>크롭된 이미지를 개별 또는 일괄로 다운로드하거나, 클립보드 복사 및 공유 기능을 사용할 수 있습니다.</p>
+    </div>
+  </div>
+
+  <h3>어떻게 작동하나요?</h3>
+  <p>Plate Cropper는 브라우저에서 직접 실행되는 클라이언트 사이드 이미지 처리 도구입니다. 업로드된 이미지는 서버로 전송되지 않으며, 모든 처리가 사용자의 브라우저에서 이루어집니다.</p>
+  <ul>
+    <li><strong>Sobel 엣지 검출:</strong> 이미지의 밝기 변화를 분석하여 객체의 윤곽선을 추출합니다.</li>
+    <li><strong>Hough Transform:</strong> 추출된 엣지 포인트를 기반으로 원형 패턴을 검출하여 번호판 위치를 특정합니다.</li>
+    <li><strong>적응형 크롭:</strong> 감지된 영역을 기준으로 최적의 사각형 크롭 영역을 자동 계산합니다.</li>
+  </ul>
+  <p style="margin-top:16px"><a href="#tool" data-page="tool" style="color:#a78bfa;text-decoration:none;font-weight:700">→ 지금 도구 사용하기</a></p>
+
+  <!-- Ad unit in content area -->
+  <div class="ad-container" style="margin:24px 0;border:none;border-radius:8px">
+    <ins class="adsbygoogle"
+         style="display:inline-block;width:728px;height:90px"
+         data-ad-client="ca-pub-8434032741883820"
+         data-ad-slot="XXXXXXXXXX"></ins>
+    <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+  </div>
+</section>
+
+<!-- ===== GUIDE PAGE ===== -->
+<section class="page-section" id="page-guide">
+  <h2>사용법 가이드</h2>
+  <p>FORLAB Plate Cropper를 사용하여 이미지에서 번호판을 크롭하는 방법을 단계별로 안내합니다.</p>
+
+  <h3>기본 사용법</h3>
+  <ul class="step-list">
+    <li><strong>이미지 업로드:</strong> 상단 메뉴에서 "도구" 탭을 클릭한 후, 이미지를 드래그 앤 드롭하거나 파일 선택 버튼을 클릭하여 이미지를 업로드합니다. JPG, PNG 등 주요 이미지 형식을 지원합니다.</li>
+    <li><strong>자동 감지 확인:</strong> 업로드된 이미지에서 AI가 자동으로 번호판 위치를 감지합니다. 보라색 점선 원으로 감지된 영역이 표시됩니다.</li>
+    <li><strong>위치 조정 (선택):</strong> 감지된 원의 내부를 드래그하여 위치를 이동하거나, 가장자리를 드래그하여 크기를 조정할 수 있습니다.</li>
+    <li><strong>확인 및 크롭:</strong> "확인 ✓" 버튼을 눌러 감지 결과를 승인한 후, "전체 크롭" 버튼으로 번호판을 크롭합니다.</li>
+    <li><strong>결과 저장:</strong> 크롭된 이미지는 우측 패널에 표시됩니다. 개별 저장, 복사, 공유 또는 전체 다운로드가 가능합니다.</li>
+  </ul>
+
+  <h3>고급 기능</h3>
+  <ul>
+    <li><strong>일괄 처리:</strong> 여러 이미지를 한 번에 업로드한 후 "전체 자동 확인" 버튼으로 모든 이미지를 한꺼번에 처리할 수 있습니다.</li>
+    <li><strong>크롭 크기 조정:</strong> 상단 슬라이더로 크롭 영역의 크기를 60%~120% 범위에서 조정할 수 있습니다.</li>
+    <li><strong>재감지:</strong> 자동 감지 결과가 정확하지 않은 경우 "재감지" 버튼으로 다시 분석할 수 있습니다.</li>
+    <li><strong>키보드 단축키:</strong> ← → 화살표 키로 이미지를 전환하고, Enter 키로 확인할 수 있습니다.</li>
+    <li><strong>추가 업로드:</strong> 작업 도중에도 "+ 사진 추가" 버튼으로 이미지를 추가할 수 있습니다.</li>
+  </ul>
+
+  <h3>자주 묻는 질문</h3>
+  <h4 style="font-size:12px;color:var(--text);margin:12px 0 4px">Q. 이미지가 서버에 업로드되나요?</h4>
+  <p>아닙니다. 모든 이미지 처리는 브라우저에서 로컬로 이루어지며, 서버로 전송되지 않습니다. 개인정보가 안전하게 보호됩니다.</p>
+  <h4 style="font-size:12px;color:var(--text);margin:12px 0 4px">Q. 어떤 이미지 형식을 지원하나요?</h4>
+  <p>JPG, PNG, GIF, BMP, WebP 등 브라우저에서 지원하는 대부분의 이미지 형식을 사용할 수 있습니다.</p>
+  <h4 style="font-size:12px;color:var(--text);margin:12px 0 4px">Q. 모바일에서도 사용할 수 있나요?</h4>
+  <p>네, 반응형 디자인으로 모바일 브라우저에서도 사용 가능합니다. 터치로 감지 영역을 조정할 수 있습니다.</p>
+</section>
+
+<!-- ===== ABOUT PAGE ===== -->
+<section class="page-section" id="page-about">
+  <h2>FORLAB 소개</h2>
+  <p>FORLAB은 이미지 처리 및 컴퓨터 비전 기술을 활용한 실용적인 웹 도구를 개발하는 프로젝트입니다.</p>
+
+  <h3>프로젝트 정보</h3>
+  <p>Plate Cropper는 법의학 및 보안 분야에서 번호판 이미지를 효율적으로 추출하기 위해 개발되었습니다. 기존의 수동 크롭 작업을 자동화하여 작업 시간을 크게 단축합니다.</p>
+
+  <h3>기술 스택</h3>
+  <ul>
+    <li><strong>프론트엔드:</strong> 순수 HTML, CSS, JavaScript (프레임워크 없음)</li>
+    <li><strong>이미지 처리:</strong> Canvas API 기반 Sobel 엣지 검출, Hough Transform 원형 검출</li>
+    <li><strong>호스팅:</strong> GitHub Pages (무료 정적 사이트 호스팅)</li>
+  </ul>
+
+  <h3>개발 배경</h3>
+  <p>보안 카메라나 현장 사진에서 번호판 영역만 빠르게 추출해야 하는 경우가 많습니다. 기존 도구들은 설치가 필요하거나 서버 업로드를 요구하여 개인정보 우려가 있었습니다. Plate Cropper는 브라우저에서 직접 실행되어 이미지가 외부로 전송되지 않으므로, 민감한 데이터도 안심하고 처리할 수 있습니다.</p>
+
+  <h3>연락처</h3>
+  <p>문의사항이나 피드백은 <a href="https://github.com/brianqwe89/brianqwe89.github.io/issues" style="color:#a78bfa">GitHub Issues</a>를 통해 보내주세요.</p>
+</section>
+
+<!-- ===== PRIVACY PAGE ===== -->
+<section class="page-section" id="page-privacy">
+  <h2>개인정보처리방침</h2>
+  <p><strong>최종 수정일:</strong> 2026년 3월 6일</p>
+
+  <h3>1. 수집하는 개인정보</h3>
+  <p>FORLAB Plate Cropper는 사용자의 개인정보를 직접 수집하지 않습니다. 업로드되는 이미지는 사용자의 브라우저에서만 처리되며, 서버로 전송되거나 저장되지 않습니다.</p>
+
+  <h3>2. 쿠키 및 추적 기술</h3>
+  <p>본 사이트는 Google AdSense 광고를 게재하고 있으며, Google은 광고 개인화를 위해 쿠키를 사용할 수 있습니다. Google의 쿠키 사용에 대한 자세한 내용은 <a href="https://policies.google.com/technologies/ads" style="color:#a78bfa" target="_blank" rel="noopener">Google 광고 정책</a>을 참조하세요.</p>
+
+  <h3>3. 제3자 광고</h3>
+  <p>본 사이트는 Google AdSense를 통해 광고를 게재합니다. Google을 포함한 제3자 광고 업체는 쿠키를 사용하여 사용자의 관심사에 기반한 광고를 표시할 수 있습니다. 사용자는 <a href="https://www.google.com/settings/ads" style="color:#a78bfa" target="_blank" rel="noopener">Google 광고 설정</a>에서 맞춤 광고를 비활성화할 수 있습니다.</p>
+
+  <h3>4. 데이터 보안</h3>
+  <p>모든 이미지 처리는 클라이언트 사이드에서 이루어지므로, 사용자의 이미지 데이터는 브라우저를 벗어나지 않습니다. HTTPS를 통해 안전한 연결을 제공합니다.</p>
+
+  <h3>5. 어린이 개인정보 보호</h3>
+  <p>본 서비스는 만 14세 미만의 어린이를 대상으로 하지 않으며, 의도적으로 어린이의 개인정보를 수집하지 않습니다.</p>
+
+  <h3>6. 개인정보처리방침 변경</h3>
+  <p>본 개인정보처리방침은 변경될 수 있으며, 변경 시 이 페이지에 게시됩니다.</p>
+
+  <h3>7. 문의</h3>
+  <p>개인정보 관련 문의는 <a href="https://github.com/brianqwe89/brianqwe89.github.io/issues" style="color:#a78bfa">GitHub Issues</a>를 통해 보내주세요.</p>
+</section>
+
+<!-- ===== TOOL PAGE (App) ===== -->
+<div class="app-content" id="page-tool">
 
 <!-- Top bar -->
 <div class="topbar">
@@ -278,15 +456,6 @@
   </div>
 </div>
 
-<!-- Top Ad Banner -->
-<div class="ad-container">
-  <ins class="adsbygoogle"
-       style="display:inline-block;width:728px;height:90px"
-       data-ad-client="ca-pub-8434032741883820"
-       data-ad-slot="XXXXXXXXXX"></ins>
-  <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
-</div>
-
 <!-- Main -->
 <div class="main">
   <!-- Left -->
@@ -327,16 +496,55 @@
   </div>
 </div>
 
-<!-- Bottom Ad Banner (Fixed) -->
-<div class="ad-container-bottom">
-  <ins class="adsbygoogle"
-       style="display:inline-block;width:728px;height:90px"
-       data-ad-client="ca-pub-8434032741883820"
-       data-ad-slot="XXXXXXXXXX"></ins>
-  <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
-</div>
+
+</div><!-- end app-content -->
+
+<!-- Site Footer -->
+<footer class="site-footer">
+  <span>&copy; 2026 FORLAB. All rights reserved.</span>
+  <span>
+    <a href="#privacy" data-page="privacy">개인정보처리방침</a> &middot;
+    <a href="#about" data-page="about">소개</a> &middot;
+    <a href="https://github.com/brianqwe89/brianqwe89.github.io" target="_blank" rel="noopener">GitHub</a>
+  </span>
+</footer>
 
 <script>
+// --- Page Navigation ---
+(function(){
+  const navLinks=document.querySelectorAll('[data-page]');
+  const pages={
+    home:document.getElementById('page-home'),
+    tool:document.getElementById('page-tool'),
+    guide:document.getElementById('page-guide'),
+    about:document.getElementById('page-about'),
+    privacy:document.getElementById('page-privacy'),
+  };
+  function showPage(name){
+    Object.entries(pages).forEach(([k,el])=>{
+      if(el.classList.contains('page-section')){
+        el.classList.toggle('visible',k===name);
+      } else {
+        el.classList.toggle('visible',k===name);
+      }
+    });
+    navLinks.forEach(a=>a.classList.toggle('active',a.dataset.page===name));
+    // adjust body overflow for tool page
+    document.body.style.overflow=(name==='tool')?'hidden':'auto';
+  }
+  navLinks.forEach(a=>a.addEventListener('click',function(e){
+    e.preventDefault();showPage(this.dataset.page);
+    window.location.hash=this.dataset.page==='home'?'':this.dataset.page;
+  }));
+  // Handle initial hash
+  const hash=window.location.hash.replace('#','');
+  if(hash&&pages[hash]) showPage(hash); else showPage('home');
+  window.addEventListener('hashchange',function(){
+    const h=window.location.hash.replace('#','');
+    if(h&&pages[h]) showPage(h); else showPage('home');
+  });
+})();
+
 (function(){
   let images=[];
   let currentIdx=0;
