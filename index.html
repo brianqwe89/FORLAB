@@ -546,6 +546,7 @@
 
   <div class="toolbar-group">
     <button class="btn btn-outline btn-sm" id="gelAutoDetectBtn">자동 감지</button>
+    <button class="btn btn-outline btn-sm" id="gelClickDetectBtn" title="겔 안쪽을 클릭하면 자동으로 영역을 잡습니다">클릭 감지</button>
     <button class="btn btn-outline btn-sm" id="gelSelectBtn" title="사각형 영역 선택">□ 수동 선택</button>
     <button class="btn btn-ghost btn-sm" id="gelClearSelBtn">선택 해제</button>
   </div>
@@ -1138,7 +1139,7 @@
   }
 
   // --- Auto Detection: find gel rectangle boundary via edge projection ---
-  function detectGelRegions(img){
+  function detectGelRegions(img,clickPt){
     const c=document.createElement('canvas');
     const maxSz=500;
     const sd=Math.min(maxSz/img.naturalWidth,maxSz/img.naturalHeight,1);
@@ -1147,207 +1148,369 @@
     const cx=c.getContext('2d');cx.drawImage(img,0,0,w,h);
     const d=cx.getImageData(0,0,w,h).data;
 
-    // Grayscale
+    // Grayscale (raw)
     const grayRaw=new Float32Array(w*h);
     for(let i=0;i<w*h;i++) grayRaw[i]=.299*d[i*4]+.587*d[i*4+1]+.114*d[i*4+2];
 
-    // --- Contrast enhancement: maximize contrast before edge detection ---
-    // 1) Global histogram stretch (min-max normalization to 0-255)
+    // --- Signal 1: Color-based gel probability (HSV segmentation) ---
+    const colorScore=new Float32Array(w*h);
+    for(let i=0;i<w*h;i++){
+      const r=d[i*4],g=d[i*4+1],b=d[i*4+2];
+      const mx=Math.max(r,g,b),mn=Math.min(r,g,b),diff=mx-mn;
+      const sat=mx===0?0:diff/mx;
+      let hue=0;
+      if(diff>0){
+        if(mx===r) hue=60*((g-b)/diff%6);
+        else if(mx===g) hue=60*((b-r)/diff+2);
+        else hue=60*((r-g)/diff+4);
+        if(hue<0) hue+=360;
+      }
+      const val=mx/255;
+      // Blue/purple gel: hue 180-300, some saturation
+      const blueScore=(hue>=180&&hue<=300)?sat*2:0;
+      // Red/pink stain (Ponceau): hue 330-360 or 0-30
+      const redScore=(hue>=330||hue<=30)?sat*1.5:0;
+      // General chroma (any colored gel vs achromatic background)
+      const chromaScore=sat*val;
+      // Intensity: exclude very bright (white paper) and very dark (black bg)
+      const intPenalty=(val>0.92?-0.5:0)+(val<0.1?-0.5:0);
+      // Variance-like: favor mid-tones (gel bands have varied intensity)
+      colorScore[i]=Math.max(blueScore,redScore)+chromaScore*0.8+intPenalty;
+    }
+
+    // --- Signal 2: Otsu thresholding on grayscale ---
+    // Find optimal threshold to separate gel from background
+    function otsuThreshold(gArr,len){
+      const hist=new Uint32Array(256);
+      for(let i=0;i<len;i++) hist[Math.round(gArr[i])]++;
+      let total=len,sumAll=0;
+      for(let i=0;i<256;i++) sumAll+=i*hist[i];
+      let sumB=0,wB=0,maxVar=0,bestT=128;
+      for(let t=0;t<256;t++){
+        wB+=hist[t];if(wB===0)continue;
+        const wF=total-wB;if(wF===0)break;
+        sumB+=t*hist[t];
+        const mB=sumB/wB,mF=(sumAll-sumB)/wF;
+        const varBetween=wB*wF*(mB-mF)*(mB-mF);
+        if(varBetween>maxVar){maxVar=varBetween;bestT=t;}
+      }
+      return bestT;
+    }
+    const otsuT=otsuThreshold(grayRaw,w*h);
+    const otsuMask=new Uint8Array(w*h);
+    // Determine if gel is darker or lighter than background
+    let darkCount=0,lightCount=0;
+    let darkColorSum=0,lightColorSum=0;
+    for(let i=0;i<w*h;i++){
+      if(grayRaw[i]<=otsuT){darkCount++;darkColorSum+=colorScore[i];}
+      else{lightCount++;lightColorSum+=colorScore[i];}
+    }
+    const gelIsDark=(darkCount>0?darkColorSum/darkCount:0)>(lightCount>0?lightColorSum/lightCount:0);
+    for(let i=0;i<w*h;i++) otsuMask[i]=(gelIsDark?(grayRaw[i]<=otsuT):(grayRaw[i]>otsuT))?1:0;
+
+    // --- Signal 3: Contrast-enhanced edge detection ---
+    // Global histogram stretch
     let gMin=255,gMax=0;
     for(let i=0;i<w*h;i++){if(grayRaw[i]<gMin)gMin=grayRaw[i];if(grayRaw[i]>gMax)gMax=grayRaw[i];}
     const gRange=gMax-gMin||1;
     const grayStretch=new Float32Array(w*h);
     for(let i=0;i<w*h;i++) grayStretch[i]=(grayRaw[i]-gMin)/gRange*255;
-
-    // 2) Local contrast enhancement (CLAHE-like): tile-based histogram equalization
-    const tileN=8; // 8x8 grid
-    const tileW=Math.ceil(w/tileN),tileH=Math.ceil(h/tileN);
-    const gray=new Float32Array(w*h);
-    // Compute local equalization per tile and bilinearly interpolate
+    // CLAHE
+    const tileN=8,tilW=Math.ceil(w/tileN),tilH=Math.ceil(h/tileN);
+    const grayEnh=new Float32Array(w*h);
     const tileMaps=[];
     for(let ty=0;ty<tileN;ty++){
       tileMaps[ty]=[];
       for(let tx=0;tx<tileN;tx++){
-        const hist=new Uint32Array(256);
-        let count=0;
-        const y0=ty*tileH,y1=Math.min((ty+1)*tileH,h);
-        const x0=tx*tileW,x1=Math.min((tx+1)*tileW,w);
-        for(let y=y0;y<y1;y++) for(let x=x0;x<x1;x++){
-          hist[Math.round(grayStretch[y*w+x])]++;count++;
-        }
-        // Clip histogram (limit contrast amplification)
-        const clipLimit=Math.max(1,Math.round(count/256*3));
-        let excess=0;
-        for(let i=0;i<256;i++) if(hist[i]>clipLimit){excess+=hist[i]-clipLimit;hist[i]=clipLimit;}
-        const add=Math.round(excess/256);
-        for(let i=0;i<256;i++) hist[i]+=add;
-        // Build cumulative distribution → mapping
-        const cdf=new Float32Array(256);
-        cdf[0]=hist[0];
+        const hist=new Uint32Array(256);let cnt=0;
+        const y0=ty*tilH,y1=Math.min((ty+1)*tilH,h);
+        const x0=tx*tilW,x1=Math.min((tx+1)*tilW,w);
+        for(let y=y0;y<y1;y++) for(let x=x0;x<x1;x++){hist[Math.round(grayStretch[y*w+x])]++;cnt++;}
+        const clipLim=Math.max(1,Math.round(cnt/256*3));
+        let exc=0;
+        for(let i=0;i<256;i++) if(hist[i]>clipLim){exc+=hist[i]-clipLim;hist[i]=clipLim;}
+        const add=Math.round(exc/256);for(let i=0;i<256;i++) hist[i]+=add;
+        const cdf=new Float32Array(256);cdf[0]=hist[0];
         for(let i=1;i<256;i++) cdf[i]=cdf[i-1]+hist[i];
-        const cdfMin=cdf[0],cdfRange=cdf[255]-cdfMin||1;
+        const cdfMin=cdf[0],cdfR=cdf[255]-cdfMin||1;
         const map=new Float32Array(256);
-        for(let i=0;i<256;i++) map[i]=(cdf[i]-cdfMin)/cdfRange*255;
+        for(let i=0;i<256;i++) map[i]=(cdf[i]-cdfMin)/cdfR*255;
         tileMaps[ty][tx]=map;
       }
     }
-    // Apply with bilinear interpolation between tiles
     for(let y=0;y<h;y++) for(let x=0;x<w;x++){
       const val=Math.round(grayStretch[y*w+x]);
-      const tcx=x/tileW-0.5,tcy=y/tileH-0.5;
+      const tcx=x/tilW-0.5,tcy=y/tilH-0.5;
       const tx0=Math.max(0,Math.floor(tcx)),ty0=Math.max(0,Math.floor(tcy));
       const tx1=Math.min(tileN-1,tx0+1),ty1=Math.min(tileN-1,ty0+1);
       const fx=Math.max(0,Math.min(1,tcx-tx0)),fy=Math.max(0,Math.min(1,tcy-ty0));
-      const v00=tileMaps[ty0][tx0][val],v10=tileMaps[ty0][tx1][val];
-      const v01=tileMaps[ty1][tx0][val],v11=tileMaps[ty1][tx1][val];
-      gray[y*w+x]=v00*(1-fx)*(1-fy)+v10*fx*(1-fy)+v01*(1-fx)*fy+v11*fx*fy;
+      grayEnh[y*w+x]=tileMaps[ty0][tx0][val]*(1-fx)*(1-fy)+tileMaps[ty0][tx1][val]*fx*(1-fy)
+                     +tileMaps[ty1][tx0][val]*(1-fx)*fy+tileMaps[ty1][tx1][val]*fx*fy;
+    }
+    // Sobel on enhanced image
+    const edgeMag=new Float32Array(w*h);
+    let maxEdge=0;
+    for(let y=1;y<h-1;y++) for(let x=1;x<w-1;x++){
+      const gx=-grayEnh[(y-1)*w+x-1]+grayEnh[(y-1)*w+x+1]
+               -2*grayEnh[y*w+x-1]+2*grayEnh[y*w+x+1]
+               -grayEnh[(y+1)*w+x-1]+grayEnh[(y+1)*w+x+1];
+      const gy=-grayEnh[(y-1)*w+x-1]-2*grayEnh[(y-1)*w+x]-grayEnh[(y-1)*w+x+1]
+               +grayEnh[(y+1)*w+x-1]+2*grayEnh[(y+1)*w+x]+grayEnh[(y+1)*w+x+1];
+      const m=Math.sqrt(gx*gx+gy*gy);
+      edgeMag[y*w+x]=m;
+      if(m>maxEdge) maxEdge=m;
     }
 
-    // --- Sobel edge magnitude (on contrast-enhanced image) ---
-    const edgeX=new Float32Array(w*h);
-    const edgeY=new Float32Array(w*h);
+    // --- Click-assisted detection: flood fill from click point ---
+    if(clickPt){
+      const sx=Math.round(clickPt.x*sd),sy=Math.round(clickPt.y*sd);
+      if(sx>=0&&sx<w&&sy>=0&&sy<h){
+        // Get reference color at click point (average 5x5 area)
+        let refR=0,refG=0,refB=0,refCnt=0;
+        for(let dy=-2;dy<=2;dy++) for(let dx=-2;dx<=2;dx++){
+          const px=sx+dx,py=sy+dy;
+          if(px>=0&&px<w&&py>=0&&py<h){
+            const idx=(py*w+px)*4;
+            refR+=d[idx];refG+=d[idx+1];refB+=d[idx+2];refCnt++;
+          }
+        }
+        refR/=refCnt;refG/=refCnt;refB/=refCnt;
+        // Color distance threshold (adaptive based on local variance)
+        let localVar=0;
+        for(let dy=-2;dy<=2;dy++) for(let dx=-2;dx<=2;dx++){
+          const px=sx+dx,py=sy+dy;
+          if(px>=0&&px<w&&py>=0&&py<h){
+            const idx=(py*w+px)*4;
+            localVar+=(d[idx]-refR)**2+(d[idx+1]-refG)**2+(d[idx+2]-refB)**2;
+          }
+        }
+        localVar=Math.sqrt(localVar/refCnt);
+        const tolBase=Math.max(35,localVar*3);
+        // Flood fill using BFS with color similarity
+        const visited=new Uint8Array(w*h);
+        const queue=[sy*w+sx];visited[sy*w+sx]=1;
+        let minX=sx,maxX=sx,minY=sy,maxY=sy;
+        while(queue.length>0){
+          const pos=queue.shift();
+          const px=pos%w,py=Math.floor(pos/w);
+          if(px<minX)minX=px;if(px>maxX)maxX=px;
+          if(py<minY)minY=py;if(py>maxY)maxY=py;
+          const neighbors=[[-1,0],[1,0],[0,-1],[0,1]];
+          for(const[dx,dy]of neighbors){
+            const nx=px+dx,ny=py+dy;
+            if(nx<0||nx>=w||ny<0||ny>=h)continue;
+            const ni=ny*w+nx;
+            if(visited[ni])continue;
+            const idx=ni*4;
+            const dist=Math.sqrt((d[idx]-refR)**2+(d[idx+1]-refG)**2+(d[idx+2]-refB)**2);
+            // Also consider edge: strong edges block expansion
+            const edgeBlock=edgeMag[ni]/(maxEdge||1);
+            if(dist<tolBase&&edgeBlock<0.3){
+              visited[ni]=1;queue.push(ni);
+            }
+          }
+        }
+        // Pad slightly
+        const pad=Math.round(Math.min(w,h)*0.01);
+        minX=Math.max(0,minX-pad);minY=Math.max(0,minY-pad);
+        maxX=Math.min(w-1,maxX+pad);maxY=Math.min(h-1,maxY+pad);
+        // Validate size
+        if((maxX-minX)>w*0.05&&(maxY-minY)>h*0.05){
+          return [{x1:Math.round(minX/sd),y1:Math.round(minY/sd),
+                   x2:Math.round(maxX/sd),y2:Math.round(maxY/sd)}];
+        }
+      }
+    }
+
+    // --- Combined 2D gel probability heatmap ---
+    const heatmap=new Float32Array(w*h);
+    // Normalize edge magnitude
+    const edgeNorm=maxEdge||1;
+    for(let i=0;i<w*h;i++){
+      // Color signal (higher = more gel-like)
+      const cSig=colorScore[i];
+      // Otsu mask (1 = gel side, 0 = background side)
+      const oSig=otsuMask[i]?1:0;
+      // Edge: pixels near strong edges are likely boundaries, not gel interior
+      // But being inside an edged region is good
+      const eSig=1-Math.min(1,edgeMag[i]/edgeNorm*2);
+      heatmap[i]=cSig*0.4+oSig*0.35+eSig*0.25;
+    }
+
+    // Smooth heatmap with box blur
+    const blurR=Math.max(2,Math.round(Math.min(w,h)*0.015));
+    const hBlur=new Float32Array(w*h);
+    // Horizontal pass
+    for(let y=0;y<h;y++){
+      let sum=0;
+      for(let x=0;x<Math.min(blurR,w);x++) sum+=heatmap[y*w+x];
+      for(let x=0;x<w;x++){
+        if(x+blurR<w) sum+=heatmap[y*w+x+blurR];
+        if(x-blurR>0) sum-=heatmap[y*w+x-blurR-1];
+        hBlur[y*w+x]=sum/Math.min(2*blurR+1,w);
+      }
+    }
+    // Vertical pass
+    const hFinal=new Float32Array(w*h);
+    for(let x=0;x<w;x++){
+      let sum=0;
+      for(let y=0;y<Math.min(blurR,h);y++) sum+=hBlur[y*w+x];
+      for(let y=0;y<h;y++){
+        if(y+blurR<h) sum+=hBlur[(y+blurR)*w+x];
+        if(y-blurR>0) sum-=hBlur[(y-blurR-1)*w+x];
+        hFinal[y*w+x]=sum/Math.min(2*blurR+1,h);
+      }
+    }
+
+    // Threshold heatmap using Otsu on heatmap values
+    // Quantize heatmap to 0-255 for Otsu
+    let hMin=Infinity,hMax=-Infinity;
+    for(let i=0;i<w*h;i++){if(hFinal[i]<hMin)hMin=hFinal[i];if(hFinal[i]>hMax)hMax=hFinal[i];}
+    const hRange=hMax-hMin||1;
+    const hQuant=new Float32Array(w*h);
+    for(let i=0;i<w*h;i++) hQuant[i]=(hFinal[i]-hMin)/hRange*255;
+    const heatT=otsuThreshold(hQuant,w*h);
+    const gelMask=new Uint8Array(w*h);
+    for(let i=0;i<w*h;i++) gelMask[i]=hQuant[i]>=heatT?1:0;
+
+    // --- Connected component analysis: find largest blob ---
+    const labels=new Int32Array(w*h).fill(-1);
+    let nextLabel=0;
+    const compSizes=[];
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+      const idx=y*w+x;
+      if(!gelMask[idx]||labels[idx]>=0) continue;
+      // BFS flood fill
+      const queue=[idx];labels[idx]=nextLabel;let size=0;
+      while(queue.length>0){
+        const pos=queue.shift();size++;
+        const px=pos%w,py=Math.floor(pos/w);
+        for(const[dx,dy]of[[-1,0],[1,0],[0,-1],[0,1]]){
+          const nx=px+dx,ny=py+dy;
+          if(nx<0||nx>=w||ny<0||ny>=h)continue;
+          const ni=ny*w+nx;
+          if(gelMask[ni]&&labels[ni]<0){labels[ni]=nextLabel;queue.push(ni);}
+        }
+      }
+      compSizes.push({label:nextLabel,size});
+      nextLabel++;
+    }
+
+    // Find largest component(s) and compute bounding box
+    if(compSizes.length===0){
+      // Fallback: center 80%
+      return [{x1:Math.round(w*0.1/sd),y1:Math.round(h*0.1/sd),
+               x2:Math.round(w*0.9/sd),y2:Math.round(h*0.9/sd)}];
+    }
+    compSizes.sort((a,b)=>b.size-a.size);
+    const mainLabel=compSizes[0].label;
+    let gelTop=h,gelBot=0,gelLeft=w,gelRight=0;
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+      if(labels[y*w+x]===mainLabel){
+        if(y<gelTop)gelTop=y;if(y>gelBot)gelBot=y;
+        if(x<gelLeft)gelLeft=x;if(x>gelRight)gelRight=x;
+      }
+    }
+
+    // --- Also run edge-based detection as fallback/comparison ---
+    // Project edges onto axes
+    const edgeX=new Float32Array(w*h),edgeY=new Float32Array(w*h);
     for(let y=1;y<h-1;y++) for(let x=1;x<w-1;x++){
-      const gx=-gray[(y-1)*w+x-1]+gray[(y-1)*w+x+1]
-               -2*gray[y*w+x-1]+2*gray[y*w+x+1]
-               -gray[(y+1)*w+x-1]+gray[(y+1)*w+x+1];
-      const gy=-gray[(y-1)*w+x-1]-2*gray[(y-1)*w+x]-gray[(y-1)*w+x+1]
-               +gray[(y+1)*w+x-1]+2*gray[(y+1)*w+x]+gray[(y+1)*w+x+1];
+      const gx=-grayEnh[(y-1)*w+x-1]+grayEnh[(y-1)*w+x+1]
+               -2*grayEnh[y*w+x-1]+2*grayEnh[y*w+x+1]
+               -grayEnh[(y+1)*w+x-1]+grayEnh[(y+1)*w+x+1];
+      const gy=-grayEnh[(y-1)*w+x-1]-2*grayEnh[(y-1)*w+x]-grayEnh[(y-1)*w+x+1]
+               +grayEnh[(y+1)*w+x-1]+2*grayEnh[(y+1)*w+x]+grayEnh[(y+1)*w+x+1];
       edgeX[y*w+x]=gx;edgeY[y*w+x]=gy;
     }
-
-    // --- Phase 1: Find gel rectangle ---
-    // Project horizontal edges (strong |gy|) onto Y axis → find top/bottom
     const rowHEdge=new Float32Array(h);
-    for(let y=1;y<h-1;y++){
-      let sum=0;for(let x=1;x<w-1;x++) sum+=Math.abs(edgeY[y*w+x]);
-      rowHEdge[y]=sum/(w-2);
-    }
-    // Project vertical edges (strong |gx|) onto X axis → find left/right
+    for(let y=1;y<h-1;y++){let sum=0;for(let x=1;x<w-1;x++) sum+=Math.abs(edgeY[y*w+x]);rowHEdge[y]=sum/(w-2);}
     const colVEdge=new Float32Array(w);
-    for(let x=1;x<w-1;x++){
-      let sum=0;for(let y=1;y<h-1;y++) sum+=Math.abs(edgeX[y*w+x]);
-      colVEdge[x]=sum/(h-2);
-    }
-
-    // Smooth projections
+    for(let x=1;x<w-1;x++){let sum=0;for(let y=1;y<h-1;y++) sum+=Math.abs(edgeX[y*w+x]);colVEdge[x]=sum/(h-2);}
     function smooth(arr,k){
       const out=new Float32Array(arr.length);
-      for(let i=k;i<arr.length-k;i++){
-        let s=0;for(let j=-k;j<=k;j++) s+=arr[i+j];
-        out[i]=s/(2*k+1);
-      }
+      for(let i=k;i<arr.length-k;i++){let s=0;for(let j=-k;j<=k;j++) s+=arr[i+j];out[i]=s/(2*k+1);}
       return out;
     }
     const sRowH=smooth(rowHEdge,Math.max(2,Math.round(h*0.01)));
     const sColV=smooth(colVEdge,Math.max(2,Math.round(w*0.01)));
-
-    // Find top N peaks in edge projection
     function findTopNPeaks(arr,n,minDist){
       let maxV=0;for(let i=0;i<arr.length;i++) if(arr[i]>maxV) maxV=arr[i];
-      const thr=maxV*0.12;
-      const candidates=[];
+      const thr=maxV*0.12;const candidates=[];
       for(let i=2;i<arr.length-2;i++){
-        if(arr[i]>thr&&arr[i]>=arr[i-1]&&arr[i]>=arr[i+1]){
-          candidates.push({pos:i,val:arr[i]});
-        }
+        if(arr[i]>thr&&arr[i]>=arr[i-1]&&arr[i]>=arr[i+1]) candidates.push({pos:i,val:arr[i]});
       }
-      candidates.sort((a,b)=>b.val-a.val);
-      const picked=[];
-      for(const c of candidates){
-        if(picked.length>=n) break;
-        if(picked.every(p=>Math.abs(p.pos-c.pos)>=minDist)) picked.push(c);
-      }
-      picked.sort((a,b)=>a.pos-b.pos);
-      return picked;
+      candidates.sort((a,b)=>b.val-a.val);const picked=[];
+      for(const c of candidates){if(picked.length>=n)break;if(picked.every(p=>Math.abs(p.pos-c.pos)>=minDist))picked.push(c);}
+      picked.sort((a,b)=>a.pos-b.pos);return picked;
     }
-
-    // Score how "gel-like" a candidate region is using blue/purple tint
-    // Gels (Coomassie etc.) have blue/purple tint; backgrounds are achromatic
     function scoreGelRegion(top,bot,left,right){
       let sumBlueEx=0,sumChroma=0,sumI=0,sumI2=0,total=0;
-      const stepY=Math.max(1,Math.round((bot-top)/40));
-      const stepX=Math.max(1,Math.round((right-left)/40));
-      for(let y=top;y<=bot;y+=stepY){
-        for(let x=left;x<=right;x+=stepX){
-          const idx=(y*w+x)*4;
-          const r=d[idx],g=d[idx+1],b=d[idx+2];
-          const v=grayRaw[y*w+x];
-          sumI+=v;sumI2+=v*v;
-          // Blue excess: positive for blue/purple gel, ~0 for neutral background
-          sumBlueEx+=b-(r+g)/2;
-          // Chroma: color deviation from neutral gray (handles non-blue stains too)
-          sumChroma+=Math.max(r,g,b)-Math.min(r,g,b);
-          total++;
-        }
+      const stepY=Math.max(1,Math.round((bot-top)/40)),stepX=Math.max(1,Math.round((right-left)/40));
+      for(let y=top;y<=bot;y+=stepY) for(let x=left;x<=right;x+=stepX){
+        const idx=(y*w+x)*4;const r=d[idx],g=d[idx+1],b=d[idx+2];const v=grayRaw[y*w+x];
+        sumI+=v;sumI2+=v*v;sumBlueEx+=b-(r+g)/2;sumChroma+=Math.max(r,g,b)-Math.min(r,g,b);total++;
       }
-      if(total===0) return -Infinity;
-      const meanI=sumI/total;
-      const variance=sumI2/total-meanI*meanI;
-      const meanBlueEx=sumBlueEx/total;
-      const meanChroma=sumChroma/total;
-      // Primary: avg blue tint density (gel region has higher concentration)
-      // Secondary: avg chromaticity (colored gel vs achromatic paper/background)
-      // Tertiary: intensity variance (band patterns)
-      let score=meanBlueEx*3+meanChroma*1.5+Math.sqrt(variance)*0.3;
-      // Penalize extreme brightness (white paper) or darkness (black background)
-      if(meanI>235) score-=30;
-      if(meanI<25) score-=30;
+      if(total===0)return -Infinity;
+      const meanI=sumI/total,variance=sumI2/total-meanI*meanI;
+      let score=(sumBlueEx/total)*3+(sumChroma/total)*1.5+Math.sqrt(variance)*0.3;
+      if(meanI>235)score-=30;if(meanI<25)score-=30;
       return score;
     }
-
-    // Find up to 4 candidate peaks on each axis
     const hPeaks=findTopNPeaks(sRowH,6,Math.round(h*0.08));
     const vPeaks=findTopNPeaks(sColV,6,Math.round(w*0.08));
-
-    let gelTop=0,gelBot=h-1,gelLeft=0,gelRight=w-1;
-
-    // Pick best horizontal pair (top/bottom) by gel-likeness score
+    let eTop=0,eBot=h-1,eLeft=0,eRight=w-1;
     if(hPeaks.length>=2){
-      // Use rough left/right from strongest vertical peaks for scoring
       let tL=0,tR=w-1;
       if(vPeaks.length>=2){tL=vPeaks[0].pos;tR=vPeaks[vPeaks.length-1].pos;}
-      let bestScore=-Infinity;
-      for(let i=0;i<hPeaks.length;i++){
-        for(let j=i+1;j<hPeaks.length;j++){
-          const t=hPeaks[i].pos,b=hPeaks[j].pos;
-          if(b-t<h*0.15) continue;
-          const s=scoreGelRegion(t,b,tL,tR);
-          if(s>bestScore){bestScore=s;gelTop=t;gelBot=b;}
-        }
+      let bestS=-Infinity;
+      for(let i=0;i<hPeaks.length;i++) for(let j=i+1;j<hPeaks.length;j++){
+        const t=hPeaks[i].pos,b=hPeaks[j].pos;if(b-t<h*0.15)continue;
+        const s=scoreGelRegion(t,b,tL,tR);if(s>bestS){bestS=s;eTop=t;eBot=b;}
       }
-    } else if(hPeaks.length===1){
-      if(hPeaks[0].pos<h/2){gelTop=hPeaks[0].pos;gelBot=h-Math.round(h*0.05);}
-      else{gelBot=hPeaks[0].pos;gelTop=Math.round(h*0.05);}
     }
-
-    // Pick best vertical pair (left/right) by gel-likeness score
     if(vPeaks.length>=2){
-      let bestScore=-Infinity;
-      for(let i=0;i<vPeaks.length;i++){
-        for(let j=i+1;j<vPeaks.length;j++){
-          const l=vPeaks[i].pos,r=vPeaks[j].pos;
-          if(r-l<w*0.15) continue;
-          const s=scoreGelRegion(gelTop,gelBot,l,r);
-          if(s>bestScore){bestScore=s;gelLeft=l;gelRight=r;}
-        }
+      let bestS=-Infinity;
+      for(let i=0;i<vPeaks.length;i++) for(let j=i+1;j<vPeaks.length;j++){
+        const l=vPeaks[i].pos,r=vPeaks[j].pos;if(r-l<w*0.15)continue;
+        const s=scoreGelRegion(eTop,eBot,l,r);if(s>bestS){bestS=s;eLeft=l;eRight=r;}
       }
-    } else if(vPeaks.length===1){
-      if(vPeaks[0].pos<w/2){gelLeft=vPeaks[0].pos;gelRight=w-Math.round(w*0.05);}
-      else{gelRight=vPeaks[0].pos;gelLeft=Math.round(w*0.05);}
+    }
+    const edgeValid=(eRight-eLeft)>=w*0.15&&(eBot-eTop)>=h*0.15;
+    const heatValid=(gelRight-gelLeft)>=w*0.05&&(gelBot-gelTop)>=h*0.05;
+
+    // --- Combine: pick the best result ---
+    let fTop,fBot,fLeft,fRight;
+    if(heatValid&&edgeValid){
+      // Score both candidates using scoreGelRegion
+      const hScore=scoreGelRegion(gelTop,gelBot,gelLeft,gelRight);
+      const eScore=scoreGelRegion(eTop,eBot,eLeft,eRight);
+      // Intersect the two for best result: take inner bounds where they agree
+      // If heatmap score is much higher, prefer it; otherwise blend
+      if(hScore>eScore*1.5){
+        fTop=gelTop;fBot=gelBot;fLeft=gelLeft;fRight=gelRight;
+      } else if(eScore>hScore*1.5){
+        fTop=eTop;fBot=eBot;fLeft=eLeft;fRight=eRight;
+      } else {
+        // Weighted average of bounds (favor heatmap slightly as it's more robust)
+        const hw=0.6,ew=0.4;
+        fTop=Math.round(gelTop*hw+eTop*ew);
+        fBot=Math.round(gelBot*hw+eBot*ew);
+        fLeft=Math.round(gelLeft*hw+eLeft*ew);
+        fRight=Math.round(gelRight*hw+eRight*ew);
+      }
+    } else if(heatValid){
+      fTop=gelTop;fBot=gelBot;fLeft=gelLeft;fRight=gelRight;
+    } else if(edgeValid){
+      fTop=eTop;fBot=eBot;fLeft=eLeft;fRight=eRight;
+    } else {
+      fTop=Math.round(h*0.1);fBot=Math.round(h*0.9);
+      fLeft=Math.round(w*0.1);fRight=Math.round(w*0.9);
     }
 
-    // Validate: gel should be a reasonable portion of the image
-    const gelW=gelRight-gelLeft,gelH=gelBot-gelTop;
-    if(gelW<w*0.15||gelH<h*0.15){
-      // Detection failed, use center 80%
-      gelLeft=Math.round(w*0.1);gelRight=Math.round(w*0.9);
-      gelTop=Math.round(h*0.1);gelBot=Math.round(h*0.9);
-    }
-
-    // Return the whole gel rectangle as one region
     return [{
-      x1:Math.round(gelLeft/sd),y1:Math.round(gelTop/sd),
-      x2:Math.round(gelRight/sd),y2:Math.round(gelBot/sd)
+      x1:Math.round(fLeft/sd),y1:Math.round(fTop/sd),
+      x2:Math.round(fRight/sd),y2:Math.round(fBot/sd)
     }];
   }
 
@@ -1613,7 +1776,16 @@
     },30);
   });
 
-  $('gelSelectBtn').addEventListener('click',()=>{activeDetIdx=-1;selRect=null;gelDraw();updateButtons();});
+  // Click-assisted detection mode
+  let gelClickDetectMode=false;
+  $('gelClickDetectBtn').addEventListener('click',()=>{
+    gelClickDetectMode=!gelClickDetectMode;
+    $('gelClickDetectBtn').classList.toggle('btn-primary',gelClickDetectMode);
+    $('gelClickDetectBtn').classList.toggle('btn-outline',!gelClickDetectMode);
+    if(gelClickDetectMode) showToast('겔 안쪽을 클릭하세요');
+  });
+
+  $('gelSelectBtn').addEventListener('click',()=>{gelClickDetectMode=false;$('gelClickDetectBtn').classList.remove('btn-primary');$('gelClickDetectBtn').classList.add('btn-outline');activeDetIdx=-1;selRect=null;gelDraw();updateButtons();});
   $('gelClearSelBtn').addEventListener('click',()=>{
     selRect=null;activeDetIdx=-1;
     updateButtons();gelDraw();
@@ -1694,6 +1866,27 @@
   gelCanvasArea.addEventListener('pointerdown',e=>{
     if(!gelImages.length)return;
     const cx=e.clientX,cy=e.clientY;
+
+    // Click-assisted detection mode
+    if(gelClickDetectMode){
+      const item=gelImages[gelCurrentIdx];if(!item)return;
+      const pos=gelToImgCoords(cx,cy);
+      $('gelDetectingLabel').classList.remove('hidden');
+      setTimeout(()=>{
+        const regions=detectGelRegions(item.img,{x:pos.x,y:pos.y});
+        item.regions=regions;item.detected=true;
+        detectedRects=regions;activeDetIdx=-1;selRect=null;
+        if(regions.length>0){activeDetIdx=0;selRect={...regions[0]};}
+        $('gelDetectingLabel').classList.add('hidden');
+        gelClickDetectMode=false;
+        $('gelClickDetectBtn').classList.remove('btn-primary');
+        $('gelClickDetectBtn').classList.add('btn-outline');
+        gelDraw();gelRenderThumbs();updateButtons();
+        showToast(regions.length+'개 영역 감지됨');
+      },30);
+      return;
+    }
+
     const handle=getHandle(cx,cy);
 
     if(handle==='move'){
