@@ -1322,19 +1322,40 @@
       }
     }
 
+    // --- Signal 4: Local texture (variance) via integral images ---
+    // Gel has bands → higher local variance; paper/background is uniform → low variance
+    const texR=Math.max(3,Math.round(Math.min(w,h)*0.025));
+    const intS=new Float64Array((w+1)*(h+1));
+    const intSq=new Float64Array((w+1)*(h+1));
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+      const v=grayRaw[y*w+x];
+      const i1=(y+1)*(w+1)+x+1;
+      intS[i1]=v+intS[y*(w+1)+x+1]+intS[(y+1)*(w+1)+x]-intS[y*(w+1)+x];
+      intSq[i1]=v*v+intSq[y*(w+1)+x+1]+intSq[(y+1)*(w+1)+x]-intSq[y*(w+1)+x];
+    }
+    const localTex=new Float32Array(w*h);
+    let texMax=0;
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+      const y0=Math.max(0,y-texR),x0=Math.max(0,x-texR);
+      const y1=Math.min(h,y+texR+1),x1=Math.min(w,x+texR+1);
+      const cnt=(y1-y0)*(x1-x0);
+      const s=intS[y1*(w+1)+x1]-intS[y0*(w+1)+x1]-intS[y1*(w+1)+x0]+intS[y0*(w+1)+x0];
+      const sq=intSq[y1*(w+1)+x1]-intSq[y0*(w+1)+x1]-intSq[y1*(w+1)+x0]+intSq[y0*(w+1)+x0];
+      const v=Math.sqrt(Math.max(0,sq/cnt-(s/cnt)*(s/cnt)));
+      localTex[y*w+x]=v;
+      if(v>texMax) texMax=v;
+    }
+    const texNorm=texMax||1;
+
     // --- Combined 2D gel probability heatmap ---
     const heatmap=new Float32Array(w*h);
-    // Normalize edge magnitude
     const edgeNorm=maxEdge||1;
     for(let i=0;i<w*h;i++){
-      // Color signal (higher = more gel-like)
       const cSig=colorScore[i];
-      // Otsu mask (1 = gel side, 0 = background side)
       const oSig=otsuMask[i]?1:0;
-      // Edge: pixels near strong edges are likely boundaries, not gel interior
-      // But being inside an edged region is good
       const eSig=1-Math.min(1,edgeMag[i]/edgeNorm*2);
-      heatmap[i]=cSig*0.4+oSig*0.35+eSig*0.25;
+      const tSig=localTex[i]/texNorm;
+      heatmap[i]=cSig*0.25+oSig*0.25+eSig*0.15+tSig*0.35;
     }
 
     // Smooth heatmap with box blur
@@ -1373,7 +1394,31 @@
     const gelMask=new Uint8Array(w*h);
     for(let i=0;i<w*h;i++) gelMask[i]=hQuant[i]>=heatT?1:0;
 
-    // --- Connected component analysis: find largest blob ---
+    // --- Soft morphological closing (blur + re-threshold) to merge fragments ---
+    const closeR=Math.max(2,Math.round(Math.min(w,h)*0.02));
+    const mBlurH=new Float32Array(w*h);
+    for(let y=0;y<h;y++){
+      let sum=0;
+      for(let x=0;x<Math.min(closeR,w);x++) sum+=gelMask[y*w+x];
+      for(let x=0;x<w;x++){
+        if(x+closeR<w) sum+=gelMask[y*w+x+closeR];
+        if(x-closeR>0) sum-=gelMask[y*w+x-closeR-1];
+        mBlurH[y*w+x]=sum/Math.min(2*closeR+1,w);
+      }
+    }
+    const mBlurV=new Float32Array(w*h);
+    for(let x=0;x<w;x++){
+      let sum=0;
+      for(let y=0;y<Math.min(closeR,h);y++) sum+=mBlurH[y*w+x];
+      for(let y=0;y<h;y++){
+        if(y+closeR<h) sum+=mBlurH[(y+closeR)*w+x];
+        if(y-closeR>0) sum-=mBlurH[(y-closeR-1)*w+x];
+        mBlurV[y*w+x]=sum/Math.min(2*closeR+1,h);
+      }
+    }
+    for(let i=0;i<w*h;i++) gelMask[i]=mBlurV[i]>=0.3?1:0;
+
+    // --- Connected component analysis ---
     const labels=new Int32Array(w*h).fill(-1);
     let nextLabel=0;
     const compSizes=[];
@@ -1396,21 +1441,36 @@
       nextLabel++;
     }
 
-    // Find largest component(s) and compute bounding box
+    // Score components by gel-likeness, not just size
     if(compSizes.length===0){
-      // Fallback: center 80%
       return [{x1:Math.round(w*0.1/sd),y1:Math.round(h*0.1/sd),
                x2:Math.round(w*0.9/sd),y2:Math.round(h*0.9/sd)}];
     }
-    compSizes.sort((a,b)=>b.size-a.size);
-    const mainLabel=compSizes[0].label;
-    let gelTop=h,gelBot=0,gelLeft=w,gelRight=0;
-    for(let y=0;y<h;y++) for(let x=0;x<w;x++){
-      if(labels[y*w+x]===mainLabel){
-        if(y<gelTop)gelTop=y;if(y>gelBot)gelBot=y;
-        if(x<gelLeft)gelLeft=x;if(x>gelRight)gelRight=x;
+    // Compute bounds and scores for each component
+    const compInfo=compSizes.map(comp=>{
+      let sumC=0,sumT=0,cnt=0,cT=h,cB=0,cL=w,cR=0;
+      for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+        if(labels[y*w+x]!==comp.label) continue;
+        sumC+=colorScore[y*w+x];sumT+=localTex[y*w+x]/texNorm;cnt++;
+        if(y<cT)cT=y;if(y>cB)cB=y;if(x<cL)cL=x;if(x>cR)cR=x;
       }
-    }
+      const avgC=cnt>0?sumC/cnt:0,avgT=cnt>0?sumT/cnt:0;
+      const frac=comp.size/(w*h);
+      // Prefer 5-85% of image area (not too small, not full background)
+      const szScore=(frac>=0.05&&frac<=0.85)?1:0.2;
+      // Fill ratio: how much of bounding box is filled
+      const bw=cR-cL+1,bh=cB-cT+1;
+      const fillR=comp.size/(bw*bh);
+      const fillScore=fillR>0.4?1:0.4;
+      // Aspect ratio: gel is roughly rectangular (aspect < 4)
+      const ar=Math.max(bw,bh)/Math.min(bw,bh);
+      const arScore=ar<4?1:0.5;
+      const score=avgC*0.2+avgT*0.3+szScore*0.25+fillScore*0.15+arScore*0.1;
+      return{...comp,score,top:cT,bot:cB,left:cL,right:cR};
+    });
+    compInfo.sort((a,b)=>b.score-a.score);
+    const best=compInfo[0];
+    let gelTop=best.top,gelBot=best.bot,gelLeft=best.left,gelRight=best.right;
 
     // --- Also run edge-based detection as fallback/comparison ---
     // Project edges onto axes
@@ -1445,15 +1505,16 @@
       picked.sort((a,b)=>a.pos-b.pos);return picked;
     }
     function scoreGelRegion(top,bot,left,right){
-      let sumBlueEx=0,sumChroma=0,sumI=0,sumI2=0,total=0;
+      let sumChroma=0,sumI=0,sumI2=0,sumTex=0,total=0;
       const stepY=Math.max(1,Math.round((bot-top)/40)),stepX=Math.max(1,Math.round((right-left)/40));
       for(let y=top;y<=bot;y+=stepY) for(let x=left;x<=right;x+=stepX){
         const idx=(y*w+x)*4;const r=d[idx],g=d[idx+1],b=d[idx+2];const v=grayRaw[y*w+x];
-        sumI+=v;sumI2+=v*v;sumBlueEx+=b-(r+g)/2;sumChroma+=Math.max(r,g,b)-Math.min(r,g,b);total++;
+        sumI+=v;sumI2+=v*v;sumChroma+=Math.max(r,g,b)-Math.min(r,g,b);
+        sumTex+=localTex[y*w+x]/texNorm;total++;
       }
       if(total===0)return -Infinity;
       const meanI=sumI/total,variance=sumI2/total-meanI*meanI;
-      let score=(sumBlueEx/total)*3+(sumChroma/total)*1.5+Math.sqrt(variance)*0.3;
+      let score=(sumChroma/total)*1.5+Math.sqrt(variance)*0.5+(sumTex/total)*40;
       if(meanI>235)score-=30;if(meanI<25)score-=30;
       return score;
     }
@@ -1479,25 +1540,24 @@
     const edgeValid=(eRight-eLeft)>=w*0.15&&(eBot-eTop)>=h*0.15;
     const heatValid=(gelRight-gelLeft)>=w*0.05&&(gelBot-gelTop)>=h*0.05;
 
-    // --- Combine: pick the best result ---
+    // --- Combine: pick best or intersect ---
     let fTop,fBot,fLeft,fRight;
     if(heatValid&&edgeValid){
-      // Score both candidates using scoreGelRegion
       const hScore=scoreGelRegion(gelTop,gelBot,gelLeft,gelRight);
       const eScore=scoreGelRegion(eTop,eBot,eLeft,eRight);
-      // Intersect the two for best result: take inner bounds where they agree
-      // If heatmap score is much higher, prefer it; otherwise blend
       if(hScore>eScore*1.5){
         fTop=gelTop;fBot=gelBot;fLeft=gelLeft;fRight=gelRight;
       } else if(eScore>hScore*1.5){
         fTop=eTop;fBot=eBot;fLeft=eLeft;fRight=eRight;
       } else {
-        // Weighted average of bounds (favor heatmap slightly as it's more robust)
-        const hw=0.6,ew=0.4;
-        fTop=Math.round(gelTop*hw+eTop*ew);
-        fBot=Math.round(gelBot*hw+eBot*ew);
-        fLeft=Math.round(gelLeft*hw+eLeft*ew);
-        fRight=Math.round(gelRight*hw+eRight*ew);
+        // Intersection: take inner bounds where both methods agree
+        fTop=Math.max(gelTop,eTop);fBot=Math.min(gelBot,eBot);
+        fLeft=Math.max(gelLeft,eLeft);fRight=Math.min(gelRight,eRight);
+        // If intersection is too small, fall back to higher-scoring method
+        if(fRight-fLeft<w*0.1||fBot-fTop<h*0.1){
+          if(hScore>=eScore){fTop=gelTop;fBot=gelBot;fLeft=gelLeft;fRight=gelRight;}
+          else{fTop=eTop;fBot=eBot;fLeft=eLeft;fRight=eRight;}
+        }
       }
     } else if(heatValid){
       fTop=gelTop;fBot=gelBot;fLeft=gelLeft;fRight=gelRight;
@@ -1507,6 +1567,12 @@
       fTop=Math.round(h*0.1);fBot=Math.round(h*0.9);
       fLeft=Math.round(w*0.1);fRight=Math.round(w*0.9);
     }
+
+    // Add small padding to avoid cutting gel edges
+    const padX=Math.round(Math.max(2,(fRight-fLeft)*0.02));
+    const padY=Math.round(Math.max(2,(fBot-fTop)*0.02));
+    fTop=Math.max(0,fTop-padY);fBot=Math.min(h-1,fBot+padY);
+    fLeft=Math.max(0,fLeft-padX);fRight=Math.min(w-1,fRight+padX);
 
     return [{
       x1:Math.round(fLeft/sd),y1:Math.round(fTop/sd),
