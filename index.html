@@ -547,7 +547,7 @@
 
   <div class="toolbar-group">
     <button class="btn btn-outline btn-sm" id="gelAutoDetectBtn">자동 감지</button>
-    <button class="btn btn-outline btn-sm" id="gelClickDetectBtn" title="겔 안쪽을 클릭하면 자동으로 영역을 잡습니다">클릭 감지</button>
+    <button class="btn btn-outline btn-sm" id="gelAutoDetectAllBtn" title="첨부된 모든 사진에 자동 감지를 실행합니다">전체 자동 감지</button>
     <button class="btn btn-outline btn-sm" id="gelSelectBtn" title="사각형 영역 선택">□ 수동 선택</button>
     <button class="btn btn-ghost btn-sm" id="gelClearSelBtn">선택 해제</button>
   </div>
@@ -583,6 +583,7 @@
             <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
           </svg>
           <span style="font-size:12px">겔 이미지를 선택하거나 드래그</span>
+          <span style="font-size:10px;color:#e67700;margin-top:4px">※ 사진 한 장에 겔 하나만 포함해 주세요</span>
         </label>
       </div>
     </div>
@@ -1959,16 +1960,37 @@
     showToast(regions.length+'개 영역 감지됨 ('+methodLabel+')');
   });
 
-  // Click-assisted detection mode
-  let gelClickDetectMode=false;
-  $('gelClickDetectBtn').addEventListener('click',()=>{
-    gelClickDetectMode=!gelClickDetectMode;
-    $('gelClickDetectBtn').classList.toggle('btn-primary',gelClickDetectMode);
-    $('gelClickDetectBtn').classList.toggle('btn-outline',!gelClickDetectMode);
-    if(gelClickDetectMode) showToast('겔 안쪽을 클릭하세요');
+  // Detect all images at once
+  $('gelAutoDetectAllBtn').addEventListener('click',async()=>{
+    if(!gelImages.length)return;
+    $('gelDetectingLabel').classList.remove('hidden');
+    // Load model if not ready
+    if(!u2netSession&&!u2netLoading){
+      $('gelDetectingLabel').textContent='AI 모델 로딩 중...';
+      await loadU2Net();
+    }
+    let totalRegions=0;
+    for(let i=0;i<gelImages.length;i++){
+      const item=gelImages[i];
+      $('gelDetectingLabel').textContent=(i+1)+'/'+gelImages.length+' 감지 중...';
+      await new Promise(r=>setTimeout(r,30));
+      const result=await detectGelRegions(item.img);
+      item.regions=result.regions;
+      item.detected=true;
+      totalRegions+=result.regions.length;
+    }
+    // Show first image with detection results
+    gelCurrentIdx=0;
+    const first=gelImages[0];
+    detectedRects=first.regions||[];
+    activeDetIdx=-1;selRect=null;
+    if(detectedRects.length>0){activeDetIdx=0;selRect={...detectedRects[0]};}
+    $('gelDetectingLabel').classList.add('hidden');
+    gelDraw();gelRenderThumbs();updateButtons();
+    showToast('전체 '+gelImages.length+'장에서 '+totalRegions+'개 영역 감지됨');
   });
 
-  $('gelSelectBtn').addEventListener('click',()=>{gelClickDetectMode=false;$('gelClickDetectBtn').classList.remove('btn-primary');$('gelClickDetectBtn').classList.add('btn-outline');activeDetIdx=-1;selRect=null;gelDraw();updateButtons();});
+  $('gelSelectBtn').addEventListener('click',()=>{activeDetIdx=-1;selRect=null;gelDraw();updateButtons();});
   $('gelClearSelBtn').addEventListener('click',()=>{
     selRect=null;activeDetIdx=-1;
     updateButtons();gelDraw();
@@ -2049,29 +2071,6 @@
   gelCanvasArea.addEventListener('pointerdown',e=>{
     if(!gelImages.length)return;
     const cx=e.clientX,cy=e.clientY;
-
-    // Click-assisted detection mode
-    if(gelClickDetectMode){
-      const item=gelImages[gelCurrentIdx];if(!item)return;
-      const pos=gelToImgCoords(cx,cy);
-      $('gelDetectingLabel').classList.remove('hidden');
-      $('gelDetectingLabel').textContent='감지 중...';
-      (async()=>{
-        await new Promise(r=>setTimeout(r,30));
-        const result=await detectGelRegions(item.img,{x:pos.x,y:pos.y});
-        const regions=result.regions;
-        item.regions=regions;item.detected=true;
-        detectedRects=regions;activeDetIdx=-1;selRect=null;
-        if(regions.length>0){activeDetIdx=0;selRect={...regions[0]};}
-        $('gelDetectingLabel').classList.add('hidden');
-        gelClickDetectMode=false;
-        $('gelClickDetectBtn').classList.remove('btn-primary');
-        $('gelClickDetectBtn').classList.add('btn-outline');
-        gelDraw();gelRenderThumbs();updateButtons();
-        showToast(regions.length+'개 영역 감지됨');
-      })();
-      return;
-    }
 
     const handle=getHandle(cx,cy);
 
