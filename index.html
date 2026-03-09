@@ -1772,7 +1772,7 @@
   function updateButtons(){
     const hasSelection=selRect&&Math.abs(selRect.x2-selRect.x1)>5&&Math.abs(selRect.y2-selRect.y1)>5;
     $('gelCropBtn').disabled=!hasSelection;
-    $('gelCropAllBtn').disabled=detectedRects.length===0;
+    $('gelCropAllBtn').disabled=!gelImages.some(item=>item.regions&&item.regions.length>0);
   }
 
   function gelRenderThumbs(){
@@ -2019,23 +2019,25 @@
     }
   });
 
-  // Crop all detected regions
+  // Crop all detected regions across all images
   $('gelCropAllBtn').addEventListener('click',()=>{
-    const item=gelImages[gelCurrentIdx];if(!item)return;
-    if(!detectedRects.length)return;
     const now=new Date();
     const ds=now.getFullYear()+String(now.getMonth()+1).padStart(2,'0')+String(now.getDate()).padStart(2,'0');
     let count=0;
-    detectedRects.forEach(r=>{
-      const dataURL=gelCropRect(item,r);
-      if(dataURL){
-        gelResults.push({dataURL,name:ds+'_gel'+(gelResults.length+1)+'.png'});
-        count++;
-      }
+    gelImages.forEach(item=>{
+      if(!item.regions||!item.regions.length)return;
+      item.regions.forEach(r=>{
+        const dataURL=gelCropRect(item,r);
+        if(dataURL){
+          gelResults.push({dataURL,name:ds+'_gel'+(gelResults.length+1)+'.png'});
+          count++;
+        }
+      });
     });
+    if(!count){showToast('감지된 영역이 없습니다');return;}
     gelRenderResults();
     selRect=null;activeDetIdx=-1;gelDraw();updateButtons();
-    showToast(count+'개 영역 크롭 완료');
+    showToast('전체 '+count+'개 영역 크롭 완료');
   });
 
   // Pointer events for rectangle selection & detected rect clicking
