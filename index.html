@@ -266,6 +266,7 @@
 </style>
 <!-- Google AdSense -->
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-8434032741883820" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 </head>
 <body>
 
@@ -641,6 +642,8 @@
     navLinks.forEach(a=>a.classList.toggle('active',a.dataset.page===name));
     // adjust body overflow for tool page
     document.body.style.overflow=(name==='tool'||name==='gel')?'hidden':'auto';
+    // Lazy load ML model when entering gel page
+    if(name==='gel'&&window._loadU2Net) window._loadU2Net();
   }
   navLinks.forEach(a=>a.addEventListener('click',function(e){
     e.preventDefault();showPage(this.dataset.page);
@@ -1133,13 +1136,116 @@
   const gelCanvas=$('gelCanvas'),gctx=gelCanvas.getContext('2d');
   const gelCanvasArea=$('gelCanvasArea');
 
+  // --- ML (U2-NetP) model infrastructure ---
+  let u2netSession=null;
+  let u2netLoading=false;
+  let u2netReady=false;
+
+  async function loadU2Net(){
+    if(u2netSession||u2netLoading) return u2netSession;
+    u2netLoading=true;
+    try{
+      if(typeof ort==='undefined') throw new Error('ONNX Runtime not loaded');
+      u2netSession=await ort.InferenceSession.create('./models/u2netp.onnx',{
+        executionProviders:['webgl','wasm']
+      });
+      u2netReady=true;
+      console.log('U2-NetP model loaded successfully');
+    }catch(e){
+      console.warn('U2-Net load failed, using rule-based detection:',e);
+      u2netSession=null;
+    }
+    u2netLoading=false;
+    return u2netSession;
+  }
+  window._loadU2Net=loadU2Net;
+
+  async function detectGelML(img){
+    if(!u2netSession) return null;
+    const SZ=320;
+    // Preprocess: resize to 320x320, extract RGB, normalize to 0~1
+    const pc=document.createElement('canvas');
+    pc.width=SZ;pc.height=SZ;
+    const pctx=pc.getContext('2d');
+    pctx.drawImage(img,0,0,SZ,SZ);
+    const pd=pctx.getImageData(0,0,SZ,SZ).data;
+    const input=new Float32Array(3*SZ*SZ);
+    for(let i=0;i<SZ*SZ;i++){
+      input[i]=pd[i*4]/255;             // R channel
+      input[SZ*SZ+i]=pd[i*4+1]/255;     // G channel
+      input[2*SZ*SZ+i]=pd[i*4+2]/255;   // B channel
+    }
+    // Run inference
+    const tensor=new ort.Tensor('float32',input,[1,3,SZ,SZ]);
+    const feeds={};
+    const inputName=u2netSession.inputNames[0];
+    feeds[inputName]=tensor;
+    const results=await u2netSession.run(feeds);
+    // Get first output (main saliency map)
+    const outName=u2netSession.outputNames[0];
+    const saliency=results[outName].data;
+    // Normalize saliency to 0~1
+    let sMin=Infinity,sMax=-Infinity;
+    for(let i=0;i<saliency.length;i++){
+      if(saliency[i]<sMin)sMin=saliency[i];
+      if(saliency[i]>sMax)sMax=saliency[i];
+    }
+    const sRange=sMax-sMin||1;
+    // Threshold using Otsu on quantized saliency
+    const sQuant=new Float32Array(SZ*SZ);
+    for(let i=0;i<SZ*SZ;i++) sQuant[i]=((saliency[i]-sMin)/sRange)*255;
+    // Simple Otsu
+    const hist=new Uint32Array(256);
+    for(let i=0;i<SZ*SZ;i++) hist[Math.round(sQuant[i])]++;
+    let total=SZ*SZ,sumAll=0;
+    for(let i=0;i<256;i++) sumAll+=i*hist[i];
+    let sumB=0,wB=0,maxVar=0,bestT=128;
+    for(let t=0;t<256;t++){
+      wB+=hist[t];if(wB===0)continue;
+      const wF=total-wB;if(wF===0)break;
+      sumB+=t*hist[t];
+      const mB=sumB/wB,mF=(sumAll-sumB)/wF;
+      const v=wB*wF*(mB-mF)*(mB-mF);
+      if(v>maxVar){maxVar=v;bestT=t;}
+    }
+    // Binary mask from thresholded saliency
+    let minX=SZ,maxX=0,minY=SZ,maxY=0,count=0;
+    for(let y=0;y<SZ;y++) for(let x=0;x<SZ;x++){
+      if(sQuant[y*SZ+x]>=bestT){
+        if(x<minX)minX=x;if(x>maxX)maxX=x;
+        if(y<minY)minY=y;if(y>maxY)maxY=y;
+        count++;
+      }
+    }
+    // Validate: detected region should be at least 5% of image
+    if(count<SZ*SZ*0.05||(maxX-minX)<SZ*0.05||(maxY-minY)<SZ*0.05) return null;
+    // Convert 320x320 coords back to original image coords
+    const iw=img.naturalWidth,ih=img.naturalHeight;
+    const pad=2; // small padding in 320-space
+    return [{
+      x1:Math.round(Math.max(0,minX-pad)/SZ*iw),
+      y1:Math.round(Math.max(0,minY-pad)/SZ*ih),
+      x2:Math.round(Math.min(SZ-1,maxX+pad)/SZ*iw),
+      y2:Math.round(Math.min(SZ-1,maxY+pad)/SZ*ih)
+    }];
+  }
+
   function showToast(msg){
     const t=$('toast');t.textContent=msg;t.classList.add('show');
     setTimeout(()=>t.classList.remove('show'),1800);
   }
 
   // --- Auto Detection: find gel rectangle boundary via edge projection ---
-  function detectGelRegions(img,clickPt){
+  async function detectGelRegions(img,clickPt){
+    // ML detection first (skip for click-assisted mode)
+    if(!clickPt){
+      try{
+        const mlResult=await detectGelML(img);
+        if(mlResult&&mlResult.length>0) return{regions:mlResult,method:'ai'};
+      }catch(e){console.warn('ML detection failed:',e);}
+    }
+    // Fallback: rule-based detection
+    const ruleResult=(function(){
     const c=document.createElement('canvas');
     const maxSz=500;
     const sd=Math.min(maxSz/img.naturalWidth,maxSz/img.naturalHeight,1);
@@ -1578,6 +1684,8 @@
       x1:Math.round(fLeft/sd),y1:Math.round(fTop/sd),
       x2:Math.round(fRight/sd),y2:Math.round(fBot/sd)
     }];
+    })();
+    return{regions:ruleResult,method:'rule'};
   }
 
   function gelComputeLayout(img){
@@ -1823,23 +1931,32 @@
   $('gelAddMoreInput').addEventListener('change',e=>gelAddFiles(e.target.files));
 
   // Auto detect
-  $('gelAutoDetectBtn').addEventListener('click',()=>{
+  $('gelAutoDetectBtn').addEventListener('click',async()=>{
     const item=gelImages[gelCurrentIdx];if(!item)return;
     $('gelDetectingLabel').classList.remove('hidden');
-    setTimeout(()=>{
-      const regions=detectGelRegions(item.img);
-      item.regions=regions;
-      item.detected=true;
-      detectedRects=regions;
-      activeDetIdx=-1;selRect=null;
-      if(regions.length>0){
-        activeDetIdx=0;
-        selRect={...regions[0]};
-      }
-      $('gelDetectingLabel').classList.add('hidden');
-      gelDraw();gelRenderThumbs();updateButtons();
-      showToast(regions.length+'개 영역 감지됨');
-    },30);
+    $('gelDetectingLabel').textContent=u2netReady?'AI 감지 중...':'감지 중...';
+    // Load model if not ready
+    if(!u2netSession&&!u2netLoading){
+      $('gelDetectingLabel').textContent='AI 모델 로딩 중...';
+      await loadU2Net();
+      $('gelDetectingLabel').textContent=u2netReady?'AI 감지 중...':'감지 중...';
+    }
+    // Small delay for UI update
+    await new Promise(r=>setTimeout(r,30));
+    const result=await detectGelRegions(item.img);
+    const regions=result.regions;
+    item.regions=regions;
+    item.detected=true;
+    detectedRects=regions;
+    activeDetIdx=-1;selRect=null;
+    if(regions.length>0){
+      activeDetIdx=0;
+      selRect={...regions[0]};
+    }
+    $('gelDetectingLabel').classList.add('hidden');
+    gelDraw();gelRenderThumbs();updateButtons();
+    const methodLabel=result.method==='ai'?'AI':'규칙 기반';
+    showToast(regions.length+'개 영역 감지됨 ('+methodLabel+')');
   });
 
   // Click-assisted detection mode
@@ -1938,8 +2055,11 @@
       const item=gelImages[gelCurrentIdx];if(!item)return;
       const pos=gelToImgCoords(cx,cy);
       $('gelDetectingLabel').classList.remove('hidden');
-      setTimeout(()=>{
-        const regions=detectGelRegions(item.img,{x:pos.x,y:pos.y});
+      $('gelDetectingLabel').textContent='감지 중...';
+      (async()=>{
+        await new Promise(r=>setTimeout(r,30));
+        const result=await detectGelRegions(item.img,{x:pos.x,y:pos.y});
+        const regions=result.regions;
         item.regions=regions;item.detected=true;
         detectedRects=regions;activeDetIdx=-1;selRect=null;
         if(regions.length>0){activeDetIdx=0;selRect={...regions[0]};}
@@ -1949,7 +2069,7 @@
         $('gelClickDetectBtn').classList.add('btn-outline');
         gelDraw();gelRenderThumbs();updateButtons();
         showToast(regions.length+'개 영역 감지됨');
-      },30);
+      })();
       return;
     }
 
